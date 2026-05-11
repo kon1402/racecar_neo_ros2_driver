@@ -49,6 +49,7 @@ alias teleop='ros2 launch racecar_neo_ros2_driver teleop.launch.py'
 alias racecar-source='source "$HOME/ros2_ws/install/setup.bash"'
 alias racecar-build='(cd "$HOME/ros2_ws" && colcon build --packages-select racecar_neo_ros2_driver --symlink-install) && source "$HOME/ros2_ws/install/setup.bash"'
 alias racecar-test='(cd "$HOME/ros2_ws" && colcon test --packages-select racecar_neo_ros2_driver --event-handlers console_direct+ && colcon test-result --verbose)'
+alias racecar-clear-dmatrix='python3 "$HOME/ros2_ws/src/racecar_neo_ros2_driver/scripts/clear_dotmatrix.py"'
 EOF
     echo "  added aliases to $BASHRC"
 fi

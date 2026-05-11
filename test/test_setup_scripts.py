@@ -17,6 +17,7 @@ PHASE_SCRIPTS = [
     'setup_ros2.sh',
     'setup_dev_tools.sh',
     'setup_user_env.sh',
+    'setup_dotmatrix.sh',
     'setup_workspace.sh',
 ]
 ORCHESTRATOR = 'setup_all.sh'
