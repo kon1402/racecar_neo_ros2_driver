@@ -1,5 +1,6 @@
 #!/bin/bash
-# Add the invoking user to hardware groups and source ROS2 in .bashrc.
+# Add the invoking user to hardware groups, source ROS2 in .bashrc, and install
+# convenience aliases.
 set -e
 
 USER_NAME="${SUDO_USER:-$USER}"
@@ -19,17 +20,34 @@ for grp in dialout i2c spi gpio; do
     fi
 done
 
-# Auto-source ROS2 + workspace overlay in .bashrc.
 BASHRC="$USER_HOME/.bashrc"
-MARKER="# RACECAR Neo - ROS2 + workspace overlay"
-if grep -qF "$MARKER" "$BASHRC" 2>/dev/null; then
-    echo "  .bashrc already configured"
+
+# Block 1: ROS2 + workspace overlay sourcing.
+SOURCE_MARKER="# RACECAR Neo - ROS2 + workspace overlay"
+if grep -qF "$SOURCE_MARKER" "$BASHRC" 2>/dev/null; then
+    echo "  $BASHRC already sources ROS2"
 else
     cat >> "$BASHRC" <<EOF
 
-$MARKER
+$SOURCE_MARKER
 source /opt/ros/jazzy/setup.bash
 [ -f "\$HOME/ros2_ws/install/setup.bash" ] && source "\$HOME/ros2_ws/install/setup.bash"
 EOF
     echo "  added ROS2 sourcing to $BASHRC"
+fi
+
+# Block 2: convenience aliases.
+ALIAS_MARKER="# RACECAR Neo - aliases"
+if grep -qF "$ALIAS_MARKER" "$BASHRC" 2>/dev/null; then
+    echo "  $BASHRC already has aliases"
+else
+    cat >> "$BASHRC" <<'EOF'
+
+# RACECAR Neo - aliases
+alias teleop='ros2 launch racecar_neo_ros2_driver teleop.launch.py'
+alias racecar-source='source "$HOME/ros2_ws/install/setup.bash"'
+alias racecar-build='(cd "$HOME/ros2_ws" && colcon build --packages-select racecar_neo_ros2_driver --symlink-install) && source "$HOME/ros2_ws/install/setup.bash"'
+alias racecar-test='(cd "$HOME/ros2_ws" && colcon test --packages-select racecar_neo_ros2_driver --event-handlers console_direct+ && colcon test-result --verbose)'
+EOF
+    echo "  added aliases to $BASHRC"
 fi
