@@ -6,9 +6,10 @@ set -e
 USER_NAME="${SUDO_USER:-$USER}"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 
-# Groups: dialout (ttyUSB/ttyACM), i2c (LSM9DS1), spi (MAX7219), gpio (RPi pins).
+# Groups: dialout (ttyUSB/ttyACM), i2c (LSM9DS1), spi (MAX7219), gpio (RPi pins),
+# video (vcgencmd / /dev/vcio for the RTC battery probe).
 # Skip groups that don't exist on this OS image.
-for grp in dialout i2c spi gpio; do
+for grp in dialout i2c spi gpio video; do
     if ! getent group "$grp" >/dev/null 2>&1; then
         continue
     fi
