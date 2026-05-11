@@ -56,6 +56,10 @@ ros2 launch racecar_neo_ros2_driver teleop.launch.py
 
 For boot-time startup, see [scripts/](./scripts/) for systemd units and the `setup_all.sh` idempotent installer.
 
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md).
+
 ## License
 
 GPLv3 — see [LICENSE](./LICENSE).
