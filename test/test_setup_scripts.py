@@ -22,6 +22,8 @@ PHASE_SCRIPTS = [
     'setup_coral.sh',
     'patch_gscam.sh',
     'setup_workspace.sh',
+    'setup_jupyter.sh',
+    'setup_services.sh',
 ]
 ORCHESTRATOR = 'setup_all.sh'
 ALL_SCRIPTS = PHASE_SCRIPTS + [ORCHESTRATOR]
@@ -81,6 +83,90 @@ def test_no_stray_colcon_dirs_in_package():
             f'{stray} exists; colcon was invoked from the wrong CWD. '
             f'Always run `colcon build` from $HOME/ros2_ws, not the package dir.'
         )
+
+
+class TestLaunchWrapper:
+    """launch_teleop.sh is the runtime wrapper systemd / racecar-tool calls."""
+
+    WRAPPER = SCRIPTS_DIR / 'launch_teleop.sh'
+
+    def test_exists_and_executable(self):
+        assert self.WRAPPER.is_file()
+        assert os.access(self.WRAPPER, os.X_OK)
+
+    def test_bash_syntax_clean(self):
+        result = subprocess.run(
+            ['bash', '-n', str(self.WRAPPER)],
+            capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_creates_log_dir_and_symlink(self):
+        text = self.WRAPPER.read_text()
+        # Two-part contract: timestamped subdir + atomic 'latest' symlink.
+        assert 'mkdir -p "$LOG_DIR"' in text
+        assert 'ln -sfn "$LOG_DIR" "$HOME/logs/latest"' in text
+
+    def test_sweeps_fastrtps_shm_orphans(self):
+        text = self.WRAPPER.read_text()
+        assert '/dev/shm/fastrtps_port' in text
+
+    def test_execs_ros2_launch(self):
+        # The final `exec ros2 launch` is what lets systemd track the launch PID.
+        text = self.WRAPPER.read_text()
+        assert 'exec ros2 launch racecar_neo_ros2_driver teleop.launch.py' in text
+
+
+class TestSystemdServices:
+    """The four racecar-*.service files ship with the package."""
+
+    SERVICES = (
+        'racecar-teleop.service',
+        'racecar-watchdog.service',
+        'racecar-dashboard.service',
+        'racecar-jupyter.service',
+    )
+
+    @pytest.mark.parametrize('name', SERVICES)
+    def test_service_file_exists(self, name):
+        assert (SCRIPTS_DIR / name).is_file()
+
+    @pytest.mark.parametrize('name', SERVICES)
+    def test_has_required_sections(self, name):
+        text = (SCRIPTS_DIR / name).read_text()
+        for section in ('[Unit]', '[Service]', '[Install]'):
+            assert section in text, f'{name} missing {section}'
+
+    @pytest.mark.parametrize('name', SERVICES)
+    def test_wantedby_multi_user(self, name):
+        text = (SCRIPTS_DIR / name).read_text()
+        assert 'WantedBy=multi-user.target' in text
+
+    @pytest.mark.parametrize('name', SERVICES)
+    def test_runs_as_racecar_user(self, name):
+        text = (SCRIPTS_DIR / name).read_text()
+        assert 'User=racecar' in text
+        assert 'Group=racecar' in text
+
+    def test_watchdog_bindsto_teleop(self):
+        # BindsTo means watchdog stops when teleop stops — exactly what we want.
+        text = (SCRIPTS_DIR / 'racecar-watchdog.service').read_text()
+        assert 'BindsTo=racecar-teleop.service' in text
+        assert 'After=racecar-teleop.service' in text
+
+    def test_teleop_wants_watchdog(self):
+        # Wants= pulls watchdog along whenever teleop starts (manual or boot).
+        # Without this, `systemctl start racecar-teleop` only starts teleop.
+        text = (SCRIPTS_DIR / 'racecar-teleop.service').read_text()
+        assert 'Wants=racecar-watchdog.service' in text
+
+    def test_teleop_calls_launch_wrapper(self):
+        text = (SCRIPTS_DIR / 'racecar-teleop.service').read_text()
+        assert 'launch_teleop.sh' in text
+
+    def test_watchdog_invokes_watchdog_py(self):
+        text = (SCRIPTS_DIR / 'racecar-watchdog.service').read_text()
+        assert 'watchdog.py' in text
 
 
 class TestUdevRules:
