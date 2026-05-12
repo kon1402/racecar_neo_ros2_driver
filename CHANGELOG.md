@@ -4,6 +4,60 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.0.4] — 2026-05-11
+
+Safety + recovery infrastructure: full-stack launch wrapper, restart-on-failure watchdog, four systemd services (teleop / watchdog / dashboard / jupyter), a real-time web dashboard, and quality-of-life additions to the `racecar` tool.
+
+### Added
+
+**Phase 4A — Full-stack launch + wrapper:**
+- `launch/teleop.launch.py` promoted to a full-stack aggregator. Always launches the control pipeline (joy / gamepad / mux / throttle / pwm) and conditionally includes each sensor / ML / display subsystem via `<name>_enable` launch arguments (default `true`). EdgeTPU is delayed 10 s for Coral USB firmware enumeration; the backward camera is delayed 5 s to stagger USB bandwidth contention.
+- `scripts/launch_teleop.sh` — runtime wrapper that creates `~/logs/<YYYYMMDD_HHMMSS>/`, updates `~/logs/latest` symlink atomically, sweeps FastRTPS SHM orphans (`/dev/shm/fastrtps_port*`), exports `ROS_LOG_DIR` / `ROS_HOME`, tees stdout/stderr into `teleop.log`, and `exec`s `ros2 launch` so systemd tracks the launch PID directly.
+
+**Phase 4B — Node watchdog:**
+- `scripts/watchdog.py` — supervises 8 nodes (pwm, throttle, mux, gamepad, imu, lidar, camera_forward, camera_backward). Two-signal liveness (`ros2 topic list` + `pgrep` on the entry-point path), 30 s restart cooldown, SIGTERM → SIGKILL escalation with `pkill -f`, hardware-aware skip when the device is missing (e.g. unplugged Maestro), FastRTPS SHM orphan sweep every 60 s, Pi 5 PMIC under-voltage sticky-alarm watch. Each restart spawns `ros2 launch racecar_neo_ros2_driver <node>.launch.py` with its own log under `~/logs/latest/restart_<node>_<ts>.log`. EdgeTPU + dot matrix are intentionally out of scope (USB firmware re-load risk, non-safety-critical).
+- `racecar watchdog` shell-tool entry point.
+
+**Phase 4C — systemd services:**
+- `scripts/racecar-teleop.service` — Type=exec, User=racecar, Restart=on-failure, KillMode=control-group; `ExecStart=launch_teleop.sh`. `Wants=racecar-watchdog.service` pulls the watchdog along on manual start; the watchdog's `BindsTo=racecar-teleop.service` stops it again when teleop stops.
+- `scripts/racecar-watchdog.service` — `ExecStartPre=/bin/sleep 15` lets teleop settle before the watchdog first samples liveness.
+- `scripts/racecar-dashboard.service` — port 8080 status page (see Phase 4E).
+- `scripts/racecar-jupyter.service` — JupyterLab on port 8888 with PYTHONPATH / AMENT_PREFIX_PATH / LD_LIBRARY_PATH pre-set so `import rclpy` and `import racecar_neo_ros2_driver` work inside notebooks.
+- `scripts/setup_services.sh` — idempotent installer: drops unit files in `/etc/systemd/system/`, runs `systemctl daemon-reload`, and enables each unit. Does not start them — user controls when the stack first comes up.
+- `scripts/setup_jupyter.sh` — `pip install --user jupyterlab` and creates `~/jupyter_ws/` with a starter README.
+- `setup_all.sh` now orchestrates 10 phases (added `setup_jupyter.sh` and `setup_services.sh`).
+
+**Phase 4E — Web dashboard:**
+- `scripts/dashboard.py` — stdlib-only HTTP server on `0.0.0.0:8080`. Background thread polls `ros2 node list` / `ros2 topic list` and measures `ros2 topic hz` for 7 key topics in parallel; cached snapshot served as JSON at `/api/status` and rendered as a single-page dashboard at `/`.
+- 10 node-status cards (one per monitored subsystem including edgetpu + dotmatrix); 7 topic-rate rows (`/motor`, `/mux_out`, `/imu`, `/scan`, `/camera/forward`, `/camera/backward`, `/edgetpu/inference`); System Health cards (RTC backup-battery voltage via `vcgencmd pmic_read_adc BATT_V` with green/yellow/red thresholds at 3.0 V / 2.7 V, and the Pi 5 PMIC sticky under-voltage alarm); live tail of `~/logs/latest/watchdog.log`.
+- System Health diagnostics refresh on a separate 60 s cadence (slow-changing — avoids hammering vcgencmd / hwmon every 3 s).
+- `scripts/dashboard.html` — HTML template lives in a separate file (so flake8 doesn't drown in long-line warnings on embedded CSS / JS). Auto-refreshes every 3 s.
+
+**`racecar` tool additions:**
+- `racecar cd` — chdir to the package source root (function, not subprocess, so the cd sticks in the user's shell).
+- `racecar service <action>` — `install`, `start`, `stop`, `restart`, `enable`, `disable`, `logs <unit>`, `status`, `help`. Default action `status` lists `active=` and `enabled=` per unit. Tab-completion offers the action set and (for relevant actions) the unit list `teleop / watchdog / dashboard / jupyter`.
+- `racecar cleanup [--dry-run | --force]` — list / kill stale racecar processes and FastRTPS SHM orphans. Uses sudo for root-owned PIDs when forced. Dry-run by default so it's safe to alias to a keybind.
+- `racecar watchdog` — runs the supervisor in the foreground (logs to `~/logs/latest/watchdog.log`).
+- `racecar teleop` now invokes `launch_teleop.sh` instead of `ros2 launch` directly so users get the same log dir / SHM cleanup as systemd-managed runs.
+
+**Tests (now 327 total):**
+- `test/test_watchdog.py` — NODES dict schema for all 8 nodes (required keys, topics start with `/`, launch files exist, callable checks); camera kill-pattern disambiguation; restart cooldown sanity; helpers (`_clean_fastrtps_orphans`, `_is_running`, `_find_rpi_volt_alarm`).
+- `test/test_dashboard.py` — `MONITORED` covers all 10 subsystems; `RATE_TOPICS` are a subset of monitored publishers; `get_status()` returns JSON-serializable snapshot with required keys; HTML template is present and references `/api/status`; title says RACECAR Neo (regression guard against UAV Neo leftover); `_classify_rtc` thresholds (3.0 V healthy, 2.7 V stale, below 2.7 V dead); `_collect_system_health` returns both `rtc` and `under_voltage` entries with valid statuses; port is 8080.
+- `test/test_setup_scripts.py::TestSystemdServices` — all four `.service` files exist, contain `[Unit] [Service] [Install]`, `WantedBy=multi-user.target`, `User=racecar`, `BindsTo` + `After` on watchdog, `Wants=racecar-watchdog.service` on teleop, correct ExecStart referents.
+- `test/test_setup_scripts.py::TestLaunchWrapper` — `launch_teleop.sh` exists + executable, `bash -n` clean, creates log dir + symlink, sweeps FastRTPS SHM, `exec`s ros2 launch.
+- `test/test_racecar_tool.py` — new tests for `cd`, `cleanup`, `service` (status/help/error paths).
+- `test/test_hardware.py::TestGamepad` — replaces `TestEasySMX`; accepts both joydev (`/dev/input/jsN`) and evdev (`/dev/input/eventN`) so the test passes against the user's Switch Pro Controller (which only exposes evdev).
+
+### Changed
+
+- Bumped `<version>` 0.0.3 → 0.0.4 in `package.xml` and `setup.py`.
+- `scripts/setup_all.sh` orchestrator: 8 → 10 phases.
+- `scripts/setup_dotmatrix.sh` adds SPI enable via `raspi-config nonint do_spi 0` (no-op on machines without raspi-config).
+
+### Skipped
+
+- **Phase 4D — image_relay.py** — UAV Neo's QoS-matched relay shim is a 30-line stdlib script worth porting only when something actually needs a QoS-adapted republish. Nothing in the racecar stack currently does (gscam publishes directly to `/camera/forward` with sensor_data QoS, which `edgetpu_node` subscribes to with matching QoS). Deferred; will land if and when a consumer needs it.
+
 ## [0.0.3] — 2026-05-11
 
 ML inference, dot matrix display, stable device paths, and a unified `racecar` developer CLI.
@@ -106,7 +160,8 @@ Sensor integration phase + setup automation + a 107-test pytest suite that cover
 - `maestro.py` `setRange(chan, min, max)` → `setRange(chan, min_target, max_target)` to stop shadowing Python builtins (A002)
 - Imports across the package reordered to Google style (stdlib → third-party, alphabetic within each); multi-line docstrings switched to second-line-summary format (D213)
 
-[Unreleased]: https://github.com/MITRacecarNeo/racecar_neo_ros2_driver/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/MITRacecarNeo/racecar_neo_ros2_driver/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/MITRacecarNeo/racecar_neo_ros2_driver/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/MITRacecarNeo/racecar_neo_ros2_driver/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/MITRacecarNeo/racecar_neo_ros2_driver/compare/v0.0.1...v0.0.2
 

@@ -45,8 +45,9 @@ def test_help_renders(args):
     assert result.returncode == 0
     assert 'racecar' in result.stdout
     assert 'Commands' in result.stdout
-    expected = ('build', 'test', 'source', 'teleop', 'launch',
-                'clear', 'udev', 'selftest', 'status')
+    expected = ('build', 'test', 'source', 'cd', 'teleop', 'launch',
+                'clear', 'udev', 'watchdog', 'service', 'cleanup',
+                'selftest', 'status')
     for sub in expected:
         assert sub in result.stdout, f'help missing "{sub}"'
 
@@ -93,6 +94,22 @@ def test_selftest_rejects_unknown_flag():
 # state is a valid test environment, so the assertion is unreliable.
 
 
+def test_cd_changes_pwd_to_package_root():
+    # `cd` must run in the user's shell context (no subshell), so a single
+    # bash session that sources the tool, runs `racecar cd`, then echoes PWD
+    # should print the package root.
+    script = (
+        f'set +u; source "{TOOL}"; '
+        'racecar cd && pwd'
+    )
+    result = subprocess.run(
+        ['bash', '-c', script],
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip().endswith('racecar_neo_ros2_driver')
+
+
 def test_status_runs_without_error():
     # status is read-only and idempotent; it should always succeed even with
     # no ros2 daemon / no peripherals.
@@ -100,6 +117,73 @@ def test_status_runs_without_error():
     assert result.returncode == 0
     assert 'USB peripherals' in result.stdout
     assert 'Stable device symlinks' in result.stdout
+
+
+class TestService:
+    """`racecar service` covers install/start/stop/restart/enable/disable/logs/status."""
+
+    def test_status_action_runs(self):
+        # Default action is `status`, which just calls `systemctl is-active`
+        # for each unit. No sudo required, no side effects.
+        result = _run('service', 'status')
+        assert result.returncode == 0
+        # status output enumerates each unit name.
+        for unit in ('racecar-teleop', 'racecar-watchdog',
+                     'racecar-dashboard', 'racecar-jupyter'):
+            assert unit in result.stdout, f'status missing {unit}'
+
+    def test_default_action_is_status(self):
+        # `racecar service` with no action should fall through to status.
+        result = _run('service')
+        assert result.returncode == 0
+        assert 'racecar-teleop' in result.stdout
+
+    def test_help_action(self):
+        result = _run('service', 'help')
+        assert result.returncode == 0
+        for action in ('install', 'start', 'stop', 'status', 'logs'):
+            assert action in result.stdout
+
+    def test_rejects_unknown_action(self):
+        result = _run('service', 'flambé')
+        assert result.returncode == 2
+        assert 'unknown action' in result.stderr
+
+
+class TestCleanup:
+    def test_dry_run_default_is_safe(self):
+        # Dry-run default: must always exit 0 and never invoke kill/rm.
+        result = _run('cleanup')
+        assert result.returncode == 0
+        # Either the process inventory or the SHM section should appear; both
+        # have predictable headings or 'No ...' fallback.
+        assert 'racecar processes' in result.stdout.lower() or \
+               'no racecar processes' in result.stdout.lower()
+        assert 'fastrtps shm' in result.stdout.lower() or \
+               'no fastrtps' in result.stdout.lower()
+
+    def test_dry_run_marker_appears_when_things_found(self):
+        # If the test environment has any racecar process or SHM orphan, the
+        # output should label the action as dry-run (i.e. nothing was killed).
+        # If nothing is found, the "No ..." messages stand alone — both fine.
+        result = _run('cleanup')
+        assert result.returncode == 0
+        # The "(dry-run; pass --force to ...)" hint appears once per category
+        # that found matches. We don't assert it must appear (clean system),
+        # but if anything appeared, --force must not have been silently invoked.
+        if 'pid=' in result.stdout:
+            assert '(dry-run' in result.stdout
+
+    def test_help_flag_describes_behavior(self):
+        result = _run('cleanup', '--help')
+        assert result.returncode == 0
+        assert 'dry-run' in result.stdout
+        assert '--force' in result.stdout
+
+    def test_rejects_unknown_flag(self):
+        result = _run('cleanup', '--burn-it-all')
+        assert result.returncode == 2
+        assert 'unknown flag' in result.stderr
 
 
 class TestCompletionInstalled:

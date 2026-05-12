@@ -118,17 +118,34 @@ class TestRPLIDAR:
 
 
 # ---------------------------------------------------------------------------
-# EasySMX gamepad
+# Gamepad — any USB HID joystick (EasySMX, Switch Pro, Xbox, etc.)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.hardware
-class TestEasySMX:
-    JS_DEVICE = '/dev/input/js0'
-
-    def test_joystick_device_present(self):
-        assert os.path.exists(self.JS_DEVICE), (
-            f'{self.JS_DEVICE} not present. Plug in the EasySMX USB dongle '
-            f'and power the controller; check `ls /dev/input/js*`.'
+class TestGamepad:
+    def test_gamepad_present(self):
+        # joy_node accepts both legacy /dev/input/jsN (joydev) and modern
+        # /dev/input/eventN (evdev). Newer controllers like the Switch Pro
+        # only expose evdev, so a hard check on /dev/input/js0 is too narrow.
+        import glob
+        js_devices = glob.glob('/dev/input/js*')
+        # Scrape /proc/bus/input/devices for any joystick-capable entry.
+        joystick_event = False
+        try:
+            with open('/proc/bus/input/devices') as f:
+                blob = f.read()
+            # Each block with EV=... that has 'js' or 'ABS' indicates joystick.
+            for block in blob.split('\n\n'):
+                if 'EV=' in block and ('ABS' in block or 'js' in block.lower()):
+                    if 'Handlers=' in block and 'event' in block:
+                        joystick_event = True
+                        break
+        except OSError:
+            pass
+        assert js_devices or joystick_event, (
+            'No joystick detected. Plug in the gamepad and ensure the USB '
+            'dongle is seated; check `ls /dev/input/` and '
+            '`cat /proc/bus/input/devices`.'
         )
 
 

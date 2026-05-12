@@ -28,7 +28,16 @@ racecar() {
             ;;
 
         teleop)
-            ros2 launch "$pkg" teleop.launch.py "$@"
+            # Use the launch wrapper so we get a timestamped log dir at
+            # ~/logs/<ts>/ and a fresh FastRTPS SHM sweep. Extra args (e.g.
+            # `lidar_enable:=false`) forward through to ros2 launch.
+            bash "$pkg_dir/scripts/launch_teleop.sh" "$@"
+            ;;
+
+        cd)
+            # Hop to the package source dir. Has to be a shell function (not
+            # subprocess) so the cd sticks in the user's interactive shell.
+            cd "$pkg_dir" || return 1
             ;;
 
         launch)
@@ -62,6 +71,186 @@ racecar() {
 
         udev)
             bash "$pkg_dir/scripts/setup_udev.sh"
+            ;;
+
+        watchdog)
+            # Run the watchdog in the foreground. Restarts dead nodes via
+            # their individual launch files; logs to ~/logs/latest/watchdog.log.
+            # When `racecar-watchdog.service` is installed, prefer
+            # `racecar service start watchdog`.
+            python3 "$pkg_dir/scripts/watchdog.py" "$@"
+            ;;
+
+        service)
+            local action="${1:-status}"
+            shift || true
+            local -a units=("racecar-teleop" "racecar-watchdog"
+                            "racecar-dashboard" "racecar-jupyter")
+            case "$action" in
+                install)
+                    bash "$pkg_dir/scripts/setup_services.sh"
+                    ;;
+                start)
+                    if [[ -n "$1" ]]; then
+                        sudo systemctl start "racecar-$1"
+                    else
+                        # Start teleop; BindsTo pulls watchdog with it.
+                        sudo systemctl start racecar-teleop
+                    fi
+                    ;;
+                stop)
+                    if [[ -n "$1" ]]; then
+                        sudo systemctl stop "racecar-$1"
+                    else
+                        sudo systemctl stop racecar-teleop
+                    fi
+                    ;;
+                restart)
+                    if [[ -n "$1" ]]; then
+                        sudo systemctl restart "racecar-$1"
+                    else
+                        sudo systemctl restart racecar-teleop
+                    fi
+                    ;;
+                enable|disable)
+                    for u in "${units[@]}"; do
+                        sudo systemctl "$action" "$u"
+                    done
+                    ;;
+                logs)
+                    local unit="${1:-teleop}"
+                    sudo journalctl -u "racecar-$unit" -f
+                    ;;
+                status|"")
+                    for u in "${units[@]}"; do
+                        local state
+                        state=$(systemctl is-active "$u" 2>&1 || true)
+                        local enabled
+                        enabled=$(systemctl is-enabled "$u" 2>&1 || true)
+                        printf "  %-22s  active=%-12s enabled=%s\n" \
+                            "$u" "$state" "$enabled"
+                    done
+                    ;;
+                -h|--help|help)
+                    cat <<'__RC_SVC_HELP__'
+usage: racecar service <action> [unit]
+actions:
+  install        Drop unit files in /etc/systemd/system/ + daemon-reload + enable
+  start [name]   Start racecar-<name>; default = teleop (watchdog follows via BindsTo)
+  stop [name]    Stop racecar-<name>; default = teleop
+  restart [name] Restart racecar-<name>; default = teleop
+  enable         Enable all racecar-* units (auto-start on boot)
+  disable        Disable all racecar-* units
+  logs [name]    journalctl -u racecar-<name> -f; default = teleop
+  status         active/enabled snapshot for all units (default)
+units: teleop, watchdog, dashboard, jupyter
+__RC_SVC_HELP__
+                    ;;
+                *)
+                    echo "racecar service: unknown action '$action'" >&2
+                    return 2
+                    ;;
+            esac
+            ;;
+
+        cleanup)
+            # Find orphaned/stale racecar processes + FastRTPS SHM segments.
+            # Dry-run by default; pass --force to actually kill / remove.
+            local force=0
+            for arg in "$@"; do
+                case "$arg" in
+                    -f|--force) force=1 ;;
+                    -n|--dry-run) force=0 ;;
+                    -h|--help)
+                        cat <<'__RC_CLEANUP_HELP__'
+usage: racecar cleanup [--dry-run | --force]
+  Lists racecar processes and FastRTPS SHM orphans. Default is --dry-run.
+  --force kills processes (uses sudo for root-owned ones) and removes SHM.
+__RC_CLEANUP_HELP__
+                        return 0
+                        ;;
+                    *) echo "racecar cleanup: unknown flag '$arg'" >&2; return 2 ;;
+                esac
+            done
+
+            # ----- Process inventory -----
+            # Match any process whose cmdline mentions the racecar stack.
+            local pattern='racecar_neo_ros2_driver|gscam_node|sllidar_node|ros2 launch racecar|sg dialout.*racecar'
+            local matches
+            matches=$(ps -eo pid,user,cmd --no-headers | grep -E "$pattern" | grep -v 'grep\|racecar cleanup' || true)
+
+            if [[ -z "$matches" ]]; then
+                echo "No racecar processes running."
+            else
+                echo "=== Racecar processes ==="
+                echo "$matches" | awk '{printf "  pid=%-6s user=%-8s cmd=%s\n", $1, $2, substr($0, index($0,$3))}' | head -30
+                local user_pids root_pids
+                user_pids=$(echo "$matches" | awk -v u="$USER" '$2 == u {print $1}' | tr '\n' ' ')
+                root_pids=$(echo "$matches" | awk '$2 == "root" {print $1}' | tr '\n' ' ')
+                if [[ $force -eq 1 ]]; then
+                    if [[ -n "$user_pids" ]]; then
+                        echo "Killing user-owned: $user_pids"
+                        # shellcheck disable=SC2086
+                        kill -9 $user_pids 2>/dev/null || true
+                    fi
+                    if [[ -n "$root_pids" ]]; then
+                        echo "Killing root-owned (sudo): $root_pids"
+                        # shellcheck disable=SC2086
+                        sudo kill -9 $root_pids 2>/dev/null || \
+                            echo "  (sudo failed; run as your user: sudo kill -9 $root_pids)"
+                    fi
+                else
+                    echo "(dry-run; pass --force to kill)"
+                fi
+            fi
+
+            # ----- FastRTPS SHM orphans -----
+            local shm_orphans=()
+            local shm_locks=()
+            for f in /dev/shm/fastrtps_port*; do
+                [ -e "$f" ] || continue
+                case "$f" in *_el) continue ;; esac
+                # Orphan = zero-byte data segment with no live participant.
+                if [ ! -s "$f" ]; then
+                    shm_orphans+=("$f")
+                fi
+            done
+            for el in /dev/shm/fastrtps_port*_el; do
+                [ -e "$el" ] || continue
+                local data="${el%_el}"
+                # Orphan = lock segment whose data peer is gone.
+                if [ ! -e "$data" ]; then
+                    shm_locks+=("$el")
+                fi
+            done
+
+            echo
+            if [[ ${#shm_orphans[@]} -eq 0 && ${#shm_locks[@]} -eq 0 ]]; then
+                echo "No FastRTPS SHM orphans in /dev/shm."
+            else
+                echo "=== FastRTPS SHM orphans ==="
+                for f in "${shm_orphans[@]}"; do
+                    echo "  zero-byte: $f"
+                done
+                for el in "${shm_locks[@]}"; do
+                    echo "  stale lock: $el"
+                done
+                if [[ $force -eq 1 ]]; then
+                    for f in "${shm_orphans[@]}"; do
+                        local base
+                        base=$(basename "$f")
+                        rm -f "$f" "/dev/shm/${base}_el" "/dev/shm/sem.${base}_mutex"
+                    done
+                    for el in "${shm_locks[@]}"; do
+                        local base
+                        base=$(basename "${el%_el}")
+                        rm -f "$el" "/dev/shm/sem.${base}_mutex"
+                    done
+                    echo "Removed."
+                else
+                    echo "(dry-run; pass --force to remove)"
+                fi
+            fi
             ;;
 
         selftest)
@@ -127,13 +316,31 @@ Commands:
     build               Build racecar_neo_ros2_driver (--symlink-install) and source overlay.
     test                Run the package test suite with verbose results.
     source              Source the workspace overlay into the current shell.
-    teleop              Launch the full teleop stack (gamepad + mux + throttle + pwm).
+    cd                  Change directory to the racecar_neo_ros2_driver package root.
+    teleop              Launch the full teleop stack via launch_teleop.sh wrapper
+                        (timestamped ~/logs/<ts>/ + FastRTPS SHM cleanup).
+                        Forwards args, e.g. `racecar teleop edgetpu_enable:=false`.
     launch <name>       Shortcut for `ros2 launch racecar_neo_ros2_driver <name>.launch.py`.
                         Examples: racecar launch dotmatrix
                                   racecar launch camera_forward
                                   racecar launch edgetpu
     clear --dmatrix     Flash + clear the MAX7219 dot matrix display.
     udev                Re-install the udev rules (refreshes /dev/maestro etc.).
+    watchdog            Run the node watchdog (restart-on-failure supervisor).
+                        Monitors control + sensor nodes; logs to
+                        ~/logs/latest/watchdog.log. Assumes teleop runs separately.
+    service <action>    systemd service control. Actions:
+                          install              setup_services.sh (drop + enable units)
+                          start [name]         default: teleop (watchdog follows)
+                          stop [name]          default: teleop
+                          restart [name]       default: teleop
+                          enable|disable       all units
+                          logs [name]          journalctl -f for racecar-<name>
+                          status               active/enabled summary (default)
+                        Units: teleop, watchdog, dashboard, jupyter
+    cleanup             List orphaned racecar processes + FastRTPS SHM segments.
+                        Defaults to a dry-run. Pass --force to actually kill/remove
+                        (uses sudo for root-owned PIDs).
     selftest            Hardware self-tests. Currently supported:
                           racecar selftest --dmatrix             (runs all patterns)
                           racecar selftest --dmatrix=checkerboard
@@ -166,7 +373,7 @@ _racecar_complete() {
     local sub="${COMP_WORDS[1]:-}"
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "build test source teleop launch clear udev selftest status help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "build test source cd teleop launch clear udev watchdog service cleanup selftest status help" -- "$cur") )
         return
     fi
 
@@ -181,6 +388,21 @@ _racecar_complete() {
             ;;
         clear)
             COMPREPLY=( $(compgen -W "--dmatrix" -- "$cur") )
+            ;;
+        cleanup)
+            COMPREPLY=( $(compgen -W "--dry-run --force --help" -- "$cur") )
+            ;;
+        service)
+            if [[ $COMP_CWORD -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "install start stop restart enable disable logs status help" -- "$cur") )
+            elif [[ $COMP_CWORD -eq 3 ]]; then
+                local action="${COMP_WORDS[2]}"
+                case "$action" in
+                    start|stop|restart|logs)
+                        COMPREPLY=( $(compgen -W "teleop watchdog dashboard jupyter" -- "$cur") )
+                        ;;
+                esac
+            fi
             ;;
         selftest)
             COMPREPLY=( $(compgen -W "--dmatrix --dmatrix=checkerboard --dmatrix=all-on --dmatrix=sweep --dmatrix=module-id --dmatrix=font" -- "$cur") )
