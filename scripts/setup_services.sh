@@ -12,7 +12,7 @@
 #   racecar-jupyter.service   — JupyterLab (port 8888)
 #
 # After install: `sudo systemctl start racecar-teleop` or reboot.
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

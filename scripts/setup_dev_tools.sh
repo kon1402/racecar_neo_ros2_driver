@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build tools, Python hardware libraries, and CLI utilities used across phases.
-set -e
+set -eo pipefail
 
 sudo apt-get install -y \
     build-essential cmake pkg-config ccache \

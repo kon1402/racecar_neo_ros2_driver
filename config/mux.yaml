@@ -11,3 +11,8 @@ mux_node:
 
     # Fixed rate keeps the Maestro fed and gives the watchdog a steady signal.
     publish_rate_hz: 50.0
+
+    # Arming gate: at boot, wait this long AND require a centered Joy frame
+    # before bumpers can leave IDLE. Defends against stuck-stick-at-power-on.
+    startup_grace_sec: 1.0
+    arm_axis_threshold: 0.2

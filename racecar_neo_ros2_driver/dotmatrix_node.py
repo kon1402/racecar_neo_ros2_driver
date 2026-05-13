@@ -1,10 +1,4 @@
-"""
-MAX7219 dot matrix driver — renders /dotmatrix/text, falls back to a mode glyph.
-
-Falls back to a centered 8x8 pictographic glyph for the current mux mode
-(IDLE = pause bars, TELEOP = steering wheel, AUTO = play triangle) when
-/dotmatrix/text is empty. Long text scrolls horizontally; short text static.
-"""
+"""MAX7219 dot matrix driver: renders /dotmatrix/text, falls back to mode glyph."""
 
 import time
 
@@ -13,6 +7,7 @@ from luma.core.legacy import text
 from luma.core.legacy.font import proportional, TINY_FONT as _LUMA_TINY_FONT
 from luma.core.render import canvas
 from luma.led_matrix.device import max7219
+from PIL import Image, ImageDraw
 from racecar_neo_ros2_driver.mux_node import MuxMode, select_mode
 import rclpy
 from rclpy.node import Node
@@ -96,6 +91,9 @@ def draw_glyph(draw, glyph, origin_x: int, origin_y: int = 0):
                 draw.point((origin_x + col_idx, origin_y + row_idx), fill='white')
 
 
+_RENDERED_WIDTH_CACHE: dict = {}
+
+
 def rendered_text_width(message: str, font, height: int = 8) -> int:
     """
     Pixel width of `message` as luma's `text()` actually paints it.
@@ -104,13 +102,21 @@ def rendered_text_width(message: str, font, height: int = 8) -> int:
     intentional inter-glyph padding that luma's renderer strips from the end.
     For exact centering we need the true painted width — measured by rendering
     into a scratch 1-bit PIL canvas and finding the rightmost lit column.
+
+    Memoized: this is called every render tick for the active message; the
+    result only changes when the message or font changes.
     """
-    from PIL import Image, ImageDraw
+    key = (message, id(font), height)
+    cached = _RENDERED_WIDTH_CACHE.get(key)
+    if cached is not None:
+        return cached
     scratch = Image.new('1', (max(1, len(message)) * 16, height))
     rendered_text_draw = ImageDraw.Draw(scratch)
     text(rendered_text_draw, (0, 0), message, fill='white', font=font)
     bbox = scratch.getbbox()
-    return 0 if bbox is None else bbox[2]
+    width = 0 if bbox is None else bbox[2]
+    _RENDERED_WIDTH_CACHE[key] = width
+    return width
 
 
 def text_pixel_width(message: str, font) -> int:
@@ -237,7 +243,6 @@ class DotMatrixNode(Node):
             self._label_origin[mode] = label_region_x + max(0, (label_region_w - w) // 2)
 
         self._user_text = ''
-        self._latest_joy: Joy = None
         self._mode = MuxMode.IDLE
         self._start_time = time.monotonic()
         self._pixels_rows: list = []     # row-string list when active, else []
@@ -273,7 +278,6 @@ class DotMatrixNode(Node):
             self._start_time = time.monotonic()
 
     def _joy_cb(self, msg: Joy):
-        self._latest_joy = msg
         new_mode = select_mode(msg.buttons, self._gamepad_btn, self._auto_btn)
         if new_mode != self._mode:
             self._mode = new_mode

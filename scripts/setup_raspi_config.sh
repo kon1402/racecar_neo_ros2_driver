@@ -8,7 +8,7 @@
 #
 # Idempotent: raspi-config nonint do_* is a no-op if already in the requested
 # state. Safe to re-run.
-set -e
+set -eo pipefail
 
 if ! command -v raspi-config >/dev/null; then
     echo "raspi-config not found; skipping (likely not a Raspberry Pi OS install)."

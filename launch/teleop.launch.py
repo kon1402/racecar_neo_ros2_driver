@@ -88,26 +88,14 @@ def generate_launch_description():
     )
 
     def _gated_include(name: str, delay: float = 0.0):
-        include = IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(launch_dir, f'{name}.launch.py')),
-        )
-        if delay > 0:
-            return TimerAction(
-                period=delay,
-                actions=[include],
-                condition=IfCondition(
-                    EqualsSubstitution(
-                        LaunchConfiguration(f'{name}_enable'), 'true'
-                    )
-                ),
-            )
-        # Wrap a 0-delay TimerAction so the condition still gates correctly.
+        # TimerAction with period=0 still fires correctly and lets the condition gate.
         return TimerAction(
-            period=0.0,
-            actions=[include],
+            period=delay,
+            actions=[IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(launch_dir, f'{name}.launch.py')))],
             condition=IfCondition(
-                EqualsSubstitution(LaunchConfiguration(f'{name}_enable'), 'true')
-            ),
+                EqualsSubstitution(LaunchConfiguration(f'{name}_enable'), 'true')),
         )
 
     imu_launch = _gated_include('imu')

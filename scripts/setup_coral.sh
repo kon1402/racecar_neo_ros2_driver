@@ -1,7 +1,7 @@
 #!/bin/bash
 # Coral EdgeTPU userspace — libedgetpu1-std + tflite_runtime + pycoral.
 # Wheels and .deb live under depend/. Idempotent: re-runs skip work.
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPEND_DIR="${SCRIPT_DIR}/../depend"

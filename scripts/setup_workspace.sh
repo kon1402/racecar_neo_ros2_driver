@@ -1,6 +1,6 @@
 #!/bin/bash
 # Clone sibling packages (sllidar_ros2) into the workspace and colcon build.
-set -e
+set -eo pipefail
 
 WS_DIR="${WS_DIR:-$HOME/ros2_ws}"
 SRC_DIR="$WS_DIR/src"

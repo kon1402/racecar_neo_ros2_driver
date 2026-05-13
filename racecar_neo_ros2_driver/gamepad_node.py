@@ -41,11 +41,11 @@ class GamepadNode(Node):
     def _joy_cb(self, msg: Joy):
         if len(msg.axes) <= max(self._throttle_axis, self._steering_axis):
             return
+        speed = float(msg.axes[self._throttle_axis]) * self._throttle_sign
+        steering = float(msg.axes[self._steering_axis]) * self._steering_sign
         drive = AckermannDriveStamped()
-        drive.drive.speed = float(msg.axes[self._throttle_axis]) * self._throttle_sign
-        drive.drive.steering_angle = (
-            float(msg.axes[self._steering_axis]) * self._steering_sign
-        )
+        drive.drive.speed = max(-1.0, min(1.0, speed))
+        drive.drive.steering_angle = max(-1.0, min(1.0, steering))
         self._pub.publish(drive)
 
 

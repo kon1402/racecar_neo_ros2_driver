@@ -1,7 +1,7 @@
 #!/bin/bash
 # JupyterLab — install + workspace setup for racecar student notebooks.
 # Idempotent: re-runs skip work already done.
-set -e
+set -eo pipefail
 
 USER_NAME="${SUDO_USER:-$USER}"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"

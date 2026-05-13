@@ -6,7 +6,7 @@
 # Requires: Ubuntu 24.04 (Noble), aarch64 Pi recommended. sudo password may be
 # prompted once; cached for the remainder of the run.
 
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

@@ -1,30 +1,12 @@
 """Standalone gamepad_node launch (watchdog restart target)."""
 
-import os
-
-from ament_index_python.packages import get_package_share_directory
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from racecar_neo_ros2_driver.launch_common import single_node_launch
 
 
 def generate_launch_description():
-    pkg_dir = get_package_share_directory('racecar_neo_ros2_driver')
-    default_cfg = os.path.join(pkg_dir, 'config', 'gamepad.yaml')
-
-    cfg_arg = DeclareLaunchArgument(
-        'gamepad_config',
-        default_value=default_cfg,
-        description='Path to gamepad_node config YAML',
-    )
-
-    gamepad = Node(
+    return single_node_launch(
+        arg_name='gamepad_config',
+        default_yaml='gamepad.yaml',
         package='racecar_neo_ros2_driver',
         executable='gamepad_node',
-        name='gamepad_node',
-        output='screen',
-        parameters=[LaunchConfiguration('gamepad_config')],
     )
-
-    return LaunchDescription([cfg_arg, gamepad])

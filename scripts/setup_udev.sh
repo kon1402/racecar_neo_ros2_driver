@@ -2,7 +2,7 @@
 # Install racecar udev rules + modprobe blacklists, then reload.
 # Idempotent: re-installs every run (install is cheap), but only regenerates
 # initramfs when the blacklist content changed (that step takes ~30 s).
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

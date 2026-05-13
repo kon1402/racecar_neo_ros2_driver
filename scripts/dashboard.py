@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
-"""
-RACECAR Neo web dashboard — real-time ROS2 node and topic monitor.
+"""RACECAR Neo web dashboard: live node/topic monitor on port 8080 (stdlib HTTP + rclpy)."""
 
-Serves a single-page dashboard on port 8080 showing node health, topic
-publish rates, and the tail of the watchdog log. Stdlib only (http.server,
-subprocess, threading); no Flask / Tornado / etc.
-
-Designed to run as racecar-dashboard.service.
-"""
-
+from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import logging
-import os  # noqa: F401  (kept for potential future use)
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 
 
 # ---------------------------------------------------------------------------
@@ -26,23 +23,26 @@ import time
 # ---------------------------------------------------------------------------
 
 PORT = 8080
-CACHE_TTL = 2.0  # seconds to cache status between requests
+CACHE_TTL = 2.0
+RATE_WINDOW_SEC = 3.0
 
-# One card per node; mirrors the watchdog's monitored set.
+# `supervised`: True if the watchdog will auto-restart this node. False means
+# the card may go red without any recovery — surface that to the operator so
+# the asymmetry isn't silent.
 MONITORED = {
-    'pwm': {'topic': '/motor', 'label': 'PWM (Maestro)'},
-    'throttle': {'topic': '/motor', 'label': 'Throttle (clamping)'},
-    'mux': {'topic': '/mux_out', 'label': 'Mux (arbitrator)'},
-    'gamepad': {'topic': '/gamepad_drive', 'label': 'Gamepad'},
-    'imu': {'topic': '/imu', 'label': 'LSM9DS1 IMU'},
-    'lidar': {'topic': '/scan', 'label': 'RPLIDAR'},
-    'camera_forward': {'topic': '/camera/forward', 'label': 'BRIO (forward)'},
-    'camera_backward': {'topic': '/camera/backward', 'label': 'Arducam (backward)'},
-    'edgetpu': {'topic': '/edgetpu/inference', 'label': 'Coral EdgeTPU'},
-    'dotmatrix': {'topic': '/dotmatrix/pixels', 'label': 'Dot matrix'},
+    'pwm': {'topic': '/motor', 'label': 'PWM (Maestro)', 'supervised': True},
+    'throttle': {'topic': '/motor', 'label': 'Throttle (clamping)', 'supervised': True},
+    'mux': {'topic': '/mux_out', 'label': 'Mux (arbitrator)', 'supervised': True},
+    'gamepad': {'topic': '/gamepad_drive', 'label': 'Gamepad', 'supervised': True},
+    'imu': {'topic': '/imu', 'label': 'LSM9DS1 IMU', 'supervised': True},
+    'lidar': {'topic': '/scan', 'label': 'RPLIDAR', 'supervised': True},
+    'camera_forward': {'topic': '/camera/forward', 'label': 'BRIO (forward)', 'supervised': True},
+    'camera_backward': {
+        'topic': '/camera/backward', 'label': 'Arducam (backward)', 'supervised': True},
+    'edgetpu': {'topic': '/edgetpu/inference', 'label': 'Coral EdgeTPU', 'supervised': False},
+    'dotmatrix': {'topic': '/dotmatrix/pixels', 'label': 'Dot matrix', 'supervised': False},
 }
 
-# Topics with publish-rate samples in the table view.
 RATE_TOPICS = [
     '/motor',
     '/mux_out',
@@ -72,68 +72,126 @@ _latest_status: dict = {
 }
 _monitor_running = True
 
-# Refresh slow-changing system diagnostics (RTC, under-voltage) at a longer
-# interval to avoid hammering vcgencmd / hwmon every ~3 s.
+# Refresh slow-changing system diagnostics (RTC, under-voltage) every minute,
+# not every monitor tick.
 SYSTEM_HEALTH_REFRESH_SEC = 60.0
 
 
-def _run(cmd, timeout: int = 5) -> str:
-    """Run a command and return stdout, or empty string on failure."""
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout.strip() if r.returncode == 0 else ''
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return ''
+# ---------------------------------------------------------------------------
+# Rate measurement via rclpy subscriptions (replaces `ros2 topic hz` subprocs)
+# ---------------------------------------------------------------------------
 
 
-def _get_topic_list():
-    out = _run(['ros2', 'topic', 'list'], timeout=10)
-    return out.splitlines() if out else []
+class _RateSampler(Node):
+    """Holds one BEST_EFFORT subscription per RATE_TOPICS entry and tracks arrivals."""
+
+    def __init__(self, topics, window_sec: float = RATE_WINDOW_SEC):
+        super().__init__('racecar_dashboard')
+        self._window = window_sec
+        self._stamps: dict = {t: deque() for t in topics}
+        self._lock = threading.Lock()
+        qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        # Subscribe with a generic message type via the type name lookup at
+        # spin time. Workaround: rclpy needs a concrete msg type, so peek at
+        # the topic list once after spin starts. See _attach_subscriptions.
+        self._qos = qos
+        self._topics = list(topics)
+        self._subs: dict = {}
+
+    def _record(self, topic: str):
+        now = time.monotonic()
+        with self._lock:
+            dq = self._stamps[topic]
+            dq.append(now)
+            cutoff = now - self._window
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+
+    def attach_subscriptions(self):
+        """Resolve each topic's type and create a subscription. Re-runnable; idempotent."""
+        names_types = dict(self.get_topic_names_and_types())
+        for topic in self._topics:
+            if topic in self._subs:
+                continue
+            types = names_types.get(topic)
+            if not types:
+                continue
+            try:
+                msg_module, msg_name = types[0].rsplit('/', 1)
+                pkg = msg_module.split('/')[0]
+                module = __import__(f'{pkg}.msg', fromlist=[msg_name])
+                msg_cls = getattr(module, msg_name)
+            except (ValueError, ImportError, AttributeError) as exc:
+                log.debug('Skipping %s: %s', topic, exc)
+                continue
+            self._subs[topic] = self.create_subscription(
+                msg_cls, topic, lambda _msg, t=topic: self._record(t), self._qos,
+            )
+
+    def measure_hz(self, topic: str):
+        """Return arrival rate (Hz) over the window, or None if not subscribed/no data."""
+        with self._lock:
+            dq = self._stamps.get(topic)
+            if dq is None:
+                return None
+            now = time.monotonic()
+            cutoff = now - self._window
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if len(dq) < 2:
+                return None
+            return len(dq) / self._window
+
+    def topic_list(self):
+        return sorted(self.get_topic_names_and_types(), key=lambda x: x[0])
+
+    def node_list(self):
+        return sorted(f'/{n}' if not n.startswith('/') else n for n in self.get_node_names())
 
 
-def _get_node_list():
-    out = _run(['ros2', 'node', 'list'], timeout=10)
-    return out.splitlines() if out else []
+_sampler: _RateSampler = None
+_sampler_lock = threading.Lock()
 
 
 def _measure_hz(topic: str):
-    """Measure topic rate over a short window. Returns Hz or None."""
-    try:
-        r = subprocess.run(
-            ['ros2', 'topic', 'hz', topic, '--window', '3'],
-            capture_output=True, text=True, timeout=15,
-        )
-        # ros2 topic hz prints to stdout AND stderr depending on version.
-        output = r.stdout + '\n' + r.stderr
-        for line in output.splitlines():
-            if 'average rate' in line:
-                return float(line.split(':')[1].strip())
-    except subprocess.TimeoutExpired as e:
-        # On timeout, partial output may still contain a rate measurement.
-        raw = e.stdout or b''
-        if isinstance(raw, bytes):
-            raw = raw.decode(errors='replace')
-        for line in raw.splitlines():
-            if 'average rate' in line:
-                try:
-                    return float(line.split(':')[1].strip())
-                except (ValueError, IndexError):
-                    pass
-    except (ValueError, IndexError, OSError):
-        pass
-    return None
+    """Return arrival rate (Hz) for a topic from the rclpy sampler, or None."""
+    sampler = _sampler
+    if sampler is None:
+        return None
+    return sampler.measure_hz(topic)
 
 
-def _read_watchdog_tail(n: int = 10):
-    """Return the last n lines of the watchdog log."""
-    logfile = Path.home() / 'logs' / 'latest' / 'watchdog.log'
-    if not logfile.exists():
+def _get_topic_list():
+    sampler = _sampler
+    if sampler is None:
         return []
+    return [name for name, _types in sampler.topic_list()]
+
+
+def _get_node_list():
+    sampler = _sampler
+    if sampler is None:
+        return []
+    return sampler.node_list()
+
+
+def _read_watchdog_tail(n: int = 10, max_bytes: int = 4096):
+    """Return the last n lines of the watchdog log without reading the whole file."""
+    logfile = Path.home() / 'logs' / 'latest' / 'watchdog.log'
     try:
-        lines = logfile.read_text().strip().splitlines()
-        return lines[-n:]
+        with open(logfile, 'rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            tail = f.read()
     except OSError:
         return []
+    return tail.decode(errors='replace').splitlines()[-n:]
 
 
 # RTC battery thresholds — same as TestRTC. Below 2.7 V the CR2032 can't
@@ -143,8 +201,7 @@ RTC_LOW_VOLTS = 2.7
 
 
 def _read_battery_voltage():
-    """Read Pi 5 RTC backup battery voltage. Returns volts or None on failure."""
-    import re
+    """Pi 5 RTC backup battery voltage in volts, or None on failure."""
     try:
         r = subprocess.run(
             ['vcgencmd', 'pmic_read_adc', 'BATT_V'],
@@ -159,7 +216,7 @@ def _read_battery_voltage():
 
 
 def _read_under_voltage_alarm():
-    """Pi 5 PMIC sticky low-voltage alarm. Returns True/False or None if unavailable."""
+    """Pi 5 PMIC sticky low-voltage alarm. True/False or None if unavailable."""
     for h in Path('/sys/class/hwmon').glob('hwmon*'):
         try:
             if (h / 'name').read_text().strip() == 'rpi_volt':
@@ -172,7 +229,7 @@ def _read_under_voltage_alarm():
 
 
 def _classify_rtc(volts):
-    """Map RTC battery voltage to a (status, label) tuple for dashboard rendering."""
+    """Map RTC battery voltage to (status, label) for dashboard rendering."""
     if volts is None:
         return ('dead', 'NO READING')
     if volts >= RTC_OK_VOLTS:
@@ -210,44 +267,36 @@ def _monitor_loop() -> None:
     system_health = _collect_system_health()
     while _monitor_running:
         try:
-            # Phase 1: quick check (topic list + node list).
+            # Late-binding subscription attach: new publishers may show up after
+            # dashboard start, so retry the topic→type lookup each tick.
+            if _sampler is not None:
+                _sampler.attach_subscriptions()
+
             topics = _get_topic_list()
             nodes = _get_node_list()
 
             node_status = {}
             for name, cfg in MONITORED.items():
                 present = cfg['topic'] in topics
+                if present:
+                    status = 'healthy'
+                elif cfg.get('supervised', True):
+                    status = 'dead'
+                else:
+                    status = 'unsupervised'
                 node_status[name] = {
                     'label': cfg['label'],
                     'topic': cfg['topic'],
                     'alive': present,
-                    'status': 'healthy' if present else 'dead',
+                    'supervised': cfg.get('supervised', True),
+                    'status': status,
                 }
-
-            # Phase 2: measure rates in parallel threads to keep refresh < 15 s.
-            rate_results: dict = {}
-            alive_topics = [t for t in RATE_TOPICS if t in topics]
-
-            def measure(topic):
-                rate_results[topic] = _measure_hz(topic)
-
-            threads = []
-            for topic in alive_topics:
-                t = threading.Thread(target=measure, args=(topic,), daemon=True)
-                t.start()
-                threads.append(t)
-            for t in threads:
-                t.join(timeout=10)
 
             rates = {}
             for topic in RATE_TOPICS:
-                if topic in rate_results:
-                    hz = rate_results[topic]
-                    rates[topic] = {'hz': hz, 'stale': hz is None or hz < 0.5}
-                else:
-                    rates[topic] = {'hz': None, 'stale': True}
+                hz = _measure_hz(topic)
+                rates[topic] = {'hz': hz, 'stale': hz is None or hz < 0.5}
 
-            # Phase 3: slow-refresh system diagnostics (RTC + under-voltage).
             now = time.monotonic()
             if now - last_system_health >= SYSTEM_HEALTH_REFRESH_SEC:
                 system_health = _collect_system_health()
@@ -270,7 +319,6 @@ def _monitor_loop() -> None:
         except Exception:  # noqa: BLE001
             log.exception('Error in monitor loop')
 
-        # Sleep between updates in short increments for clean shutdown.
         for _ in range(30):
             if not _monitor_running:
                 break
@@ -339,7 +387,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global _monitor_running
+    global _monitor_running, _sampler
 
     logdir = Path.home() / 'logs' / 'latest'
     handlers = [logging.StreamHandler(sys.stderr)]
@@ -356,6 +404,22 @@ def main() -> None:
         datefmt='%Y-%m-%d %H:%M:%S',
         handlers=handlers,
     )
+
+    rclpy.init()
+    with _sampler_lock:
+        _sampler = _RateSampler(RATE_TOPICS)
+
+    def _spin_sampler():
+        try:
+            rclpy.spin(_sampler)
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        except Exception:  # noqa: BLE001
+            log.exception('rclpy.spin terminated')
+
+    spinner = threading.Thread(target=_spin_sampler, daemon=True)
+    spinner.start()
+    log.info('rclpy sampler spinning')
 
     monitor = threading.Thread(target=_monitor_loop, daemon=True)
     monitor.start()
@@ -379,6 +443,11 @@ def main() -> None:
         _monitor_running = False
         server.server_close()
         monitor.join(timeout=5)
+        try:
+            _sampler.destroy_node()
+        except Exception:  # noqa: BLE001
+            pass
+        rclpy.try_shutdown()
         log.info('Dashboard stopped')
 
 
