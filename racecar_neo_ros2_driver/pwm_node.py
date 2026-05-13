@@ -28,7 +28,7 @@ class PwmNode(Node):
     def __init__(self):
         super().__init__('pwm_node')
 
-        self.declare_parameter('serial_port', '/dev/ttyACM0')
+        self.declare_parameter('serial_port', '/dev/maestro')
         self.declare_parameter('device_id', 12)
 
         self.declare_parameter('motor_channel', 0)

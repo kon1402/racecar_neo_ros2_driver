@@ -26,7 +26,7 @@
 #
 # All steps are idempotent — re-running is safe.
 
-set -e
+set -eo pipefail
 
 # Persisted overrides — `racecar setup networking --ssid=...` writes here.
 # Precedence: env vars in the current shell > persisted file > defaults.
@@ -118,26 +118,11 @@ if ! systemctl is-enabled --quiet NetworkManager-dispatcher.service; then
     CHANGES_MADE=true
 fi
 
-# --- 2. Delete prior Wi-Fi client connections on wlan0 -----------------------
-echo "[2/4] Removing any prior Wi-Fi client connection on wlan0..."
-mapfile -t prior_wifi < <(
-    nmcli -t -f NAME,TYPE,DEVICE con show |
-    awk -F: -v ap="$AP_CON_NAME" '
-        $2 == "802-11-wireless" && $1 != ap { print $1 }
-    '
-)
-if [ "${#prior_wifi[@]}" -eq 0 ]; then
-    echo "  No prior Wi-Fi client connections found."
-else
-    for con in "${prior_wifi[@]}"; do
-        echo "  Deleting connection '$con'..."
-        sudo nmcli connection delete "$con"
-        CHANGES_MADE=true
-    done
-fi
-
-# --- 3. Create or update the AP connection -----------------------------------
-echo "[3/4] Configuring AP connection '$AP_CON_NAME' (SSID: $AP_SSID)..."
+# --- 2. Create or update the AP connection -----------------------------------
+# Order matters: the AP must be up BEFORE we delete the prior Wi-Fi client
+# below. If any step from here through netplan-apply fails under `set -e`,
+# the user's existing Wi-Fi connection is still intact for recovery.
+echo "[2/4] Configuring AP connection '$AP_CON_NAME' (SSID: $AP_SSID)..."
 if nmcli -t -f NAME con show | grep -qx "$AP_CON_NAME"; then
     # Diff each user-tunable setting against what nmcli reports; only call
     # `nmcli connection modify` when at least one field differs. (modify
@@ -204,8 +189,8 @@ if [ "$CHANGES_MADE" = "true" ] || [ "$ap_state" != "activated" ]; then
     sudo nmcli connection up "$AP_CON_NAME" >/dev/null 2>&1 || true
 fi
 
-# --- 4. eth0 dual-IP via netplan ---------------------------------------------
-echo "[4/4] Configuring eth0 dual-IP (static $ETH_STATIC_ADDR + DHCP)..."
+# --- 3. eth0 dual-IP via netplan ---------------------------------------------
+echo "[3/4] Configuring eth0 dual-IP (static $ETH_STATIC_ADDR + DHCP)..."
 TMP_NETPLAN=$(mktemp)
 cat >"$TMP_NETPLAN" <<YAML
 network:
@@ -241,6 +226,27 @@ if [ "$CHANGES_MADE" = "true" ]; then
     echo
     echo "Applying netplan..."
     sudo netplan apply
+fi
+
+# --- 4. Delete prior Wi-Fi client connections on wlan0 -----------------------
+# Done LAST: by this point AP + eth0 are up, so removing the user's old
+# Wi-Fi client connection can't strand the box. If anything above failed
+# under `set -e`, we never get here and the user's wifi survives.
+echo "[4/4] Removing any prior Wi-Fi client connection on wlan0..."
+mapfile -t prior_wifi < <(
+    nmcli -t -f NAME,TYPE,DEVICE con show |
+    awk -F: -v ap="$AP_CON_NAME" '
+        $2 == "802-11-wireless" && $1 != ap { print $1 }
+    '
+)
+if [ "${#prior_wifi[@]}" -eq 0 ]; then
+    echo "  No prior Wi-Fi client connections found."
+else
+    for con in "${prior_wifi[@]}"; do
+        echo "  Deleting connection '$con'..."
+        sudo nmcli connection delete "$con"
+        CHANGES_MADE=true
+    done
 fi
 
 echo

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Add the invoking user to hardware groups, source ROS2 in .bashrc, and install
 # convenience aliases.
-set -e
+set -eo pipefail
 
 USER_NAME="${SUDO_USER:-$USER}"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"

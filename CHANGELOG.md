@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.0.7] — 2026-05-12
+
+Functionality audit before tagging, plus the lidar/ModemManager hardening surfaced by the 2026-05-12 endurance test. Safety hardening, Pi 5 efficiency wins, and dead-code removal — no new features.
+
+### Added
+
+- `racecar_neo_ros2_driver/launch_common.py` — `single_node_launch()` helper that builds a one-node `LaunchDescription` from `(arg_name, default_yaml, package, executable)` plus optional `node_name` / `remappings`. Per-node launch files (pwm, mux, throttle, gamepad, lidar, dotmatrix, edgetpu, camera_forward, camera_backward) collapse onto it; IMU stays bespoke (two YAML params).
+- `mux_node` boot-time arming gate: new `startup_grace_sec` (default 1.0) and `arm_axis_threshold` (default 0.2) parameters. After boot the mux publishes zero until the grace period has elapsed AND it has seen one `/joy` frame with every axis below threshold. Defends against stuck-stick-at-power-on. New `joy_is_centered(axes, threshold)` helper.
+- `dashboard.MONITORED` entries gain a `supervised` boolean. EdgeTPU and dotmatrix are marked `supervised=False` since the watchdog doesn't restart them; their card status is `'unsupervised'` rather than `'dead'` when absent.
+- `PGREP_FAIL_THRESHOLD = 5` in `watchdog.py`. `_is_running` now counts consecutive pgrep exceptions per-pattern and escalates from "assume alive" to "assume down" after the threshold, so a broken pgrep can't mask a real outage forever.
+- `test/test_mux.py::TestJoyCentered` covering the new arming-gate helper.
+- `test/test_setup_scripts.py::test_scripts_use_pipefail` extends the existing `set -e` check.
+- `docs/post-audit-tests.md` — on-robot walk-through for verifying v0.0.7.
+
+### Fixed
+
+- **Maestro hardcoded `/dev/ttyACM0`** in `pwm_node.py` and `maestro.py`. Footgun for `ros2 run` invocations without `--params-file` (Coral / joystick passthrough can grab ACM0 transiently). Both now default to `/dev/maestro` — the udev symlink contract.
+- **Gamepad node didn't clip to `[-1, 1]`** before publishing. A miscalibrated EasySMX or a typo'd `throttle_sign` could escape downstream. Throttle clamps already, but the contract per `[[project_conventions]]` is enforced at every boundary now.
+- **`watchdog.py` shelled out to `ros2 topic list` every 5 s** — measurable Pi 5 CPU + DDS discovery pressure. Replaced with an in-process rclpy `Node` (`racecar_watchdog`) spun in a daemon thread, calling `node.get_topic_names_and_types()` directly. `_get_active_topics()` keeps the subprocess fallback for module-level helper tests.
+- **`dashboard.py` fan-out of `ros2 topic hz` subprocesses** every 3 s, leaking zombies on `join(timeout)` mismatches. Replaced with a single long-lived rclpy node (`racecar_dashboard`) that subscribes BEST_EFFORT to each `RATE_TOPICS` entry, records monotonic arrival timestamps in a per-topic deque, and computes Hz over a 3 s window. Late-binding `attach_subscriptions()` picks up new publishers each tick.
+- **`dashboard.py` read the full `watchdog.log` every refresh.** Replaced with seek-from-end so only the last 4 KB are read regardless of file size.
+- **`dotmatrix_node` re-rendered text width every tick** — `PIL.Image` allocation at 15 Hz. Now memoized on `(message, id(font), height)`; `PIL` import hoisted to module top.
+- **`watchdog.py` leaked the per-restart `log_fh`.** `_child_procs` now stores `(proc, log_fh)` tuples and closes the handle when the child is reaped.
+- **`dashboard.py` dead `import os`** removed. `import re` hoisted out of `_read_battery_voltage` to module top per Google style.
+- **`dotmatrix_node._latest_joy`** was assigned but never read. Dropped.
+- **`launch/teleop.launch.py::_gated_include`** had two near-identical TimerAction branches. `TimerAction(period=0.0, condition=...)` honors the condition correctly, so the special-case was unnecessary. Collapsed.
+- **`setup_networking.sh` destructive step ordering** — `nmcli connection delete` of prior Wi-Fi client connections ran before `netplan apply` on eth0. Any failure under `set -e` between them could strand an SSH-over-WiFi user. Reordered: dispatcher install → AP configure + bring up → eth0 netplan apply → delete prior Wi-Fi client. The user's existing WiFi survives any earlier failure now.
+- **Bash `pipefail` missing across phase scripts** — `set -e` alone let `wget | dpkg -i` chains silently mask upstream failures. Standardized to `set -eo pipefail` across phase scripts + orchestrator; `test_scripts_use_pipefail` enforces it. `-u` not adopted yet (per-script audit of `${VAR:-default}` usage needed first).
+- **Watchdog and dashboard module docstrings** trimmed to one-line summaries per `[[feedback_terse_comments]]`.
+- **Lidar silently stopped publishing under ModemManager probe** — 2026-05-12 8h endurance: a snap-store refresh triggered `systemctl daemon-reload`, ModemManager re-probed every tty, and its probe of the lidar's CP2102 (`10c4:ea60`) desynced the sllidar SDK's binary frame reader. Process stayed alive, `/scan` stayed advertised, no scans came through. Two-part fix: (1) `scripts/udev/99-racecar.rules` adds `ENV{ID_MM_DEVICE_IGNORE}="1"` to the lidar rule so MM never opens that port, and (2) `scripts/watchdog.py` gains a `freshness_sec` field on NODES entries — if set, the watchdog subscribes via rclpy (BEST_EFFORT) and treats the topic as failed when no message arrives within the window, separately from process-presence. Only `lidar` opts in (`freshness_sec=5.0`), with a post-restart grace so cooldown can't trigger a self-restart loop. New tests cover the udev rule and the freshness monitor.
+- **Mux arming gate never fired on the EasySMX** — `joy_is_centered` checked every axis under threshold 0.2, but axes[2] (LT) and axes[5] (RT) rest at +1.0 in Xbox-360 mode. Result: the v0.0.7 arming gate blocked driving entirely on the real controller. Added `arm_ignore_axes` parameter (default `[2, 5]`) that `joy_is_centered` skips during the centered check, leaving the stick axes (0, 1, 3, 4) fully gated. Three new tests cover the trigger-at-rest case, the ignore-axes path, and that ignoring triggers doesn't excuse a stuck stick.
+
+### Changed
+
+- Bumped `<version>` 0.0.6 → 0.0.7 in `package.xml` and `setup.py`.
+- `config/mux.yaml` documents the new `startup_grace_sec` and `arm_axis_threshold` parameters.
+- `Maestro.__init__` docstring updated to mention `/dev/maestro`.
+
+### Deferred
+
+- **EdgeTPU under watchdog supervision** — the `1a6e:089a → 18d1:9302` USB firmware enumeration needs its own retry-after-reset logic. v0.0.7 only marks edgetpu/dotmatrix as `supervised=False` on the dashboard.
+- **Topic-name constants module** — topic strings repeat across nodes, watchdog, dashboard, launch files. Mechanical but large; punted.
+- **PWM parameter nesting** — `motor.{channel,center_pwm,magnitude_pwm}` would read better than the flat parameters, but the YAML round-trip is non-trivial.
+- **Watchdog failure-path test coverage** — cooldown, stale-child-kill, device-check-skip, volt-alarm-tripped branches are still mostly untested. Its own focused PR.
+- **Shared `pi_health.py`** — RTC voltage classifier + BATT_V regex + rpi_volt hwmon walk live in watchdog, dashboard, and `test_hardware.py` with drift between copies.
+
 ## [0.0.6] — 2026-05-11
 
 Phase 6: networking. eth0 dual-IP for predictable wired access, wlan0 isolated AP so anyone within range can reach the robot's dashboard / JupyterLab / SSH without needing existing WiFi infrastructure.

@@ -8,8 +8,8 @@ PY2 = version_info[0] == 2
 
 
 class Controller:
-    # Maestro must be in "USB Dual Port" mode; /dev/ttyACM0 is the command port.
-    def __init__(self, ttyStr='/dev/ttyACM0', device=0x0c):
+    # Maestro must be in "USB Dual Port" mode; udev exposes the command port as /dev/maestro.
+    def __init__(self, ttyStr='/dev/maestro', device=0x0c):
         self.usb = serial.Serial(ttyStr)
         self.PololuCmd = chr(0xaa) + chr(device)
         self.Targets = [0] * 24

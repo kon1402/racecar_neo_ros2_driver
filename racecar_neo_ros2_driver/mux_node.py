@@ -32,6 +32,21 @@ def select_mode(buttons, gamepad_btn: int, auto_btn: int) -> MuxMode:
     return MuxMode.IDLE
 
 
+def joy_is_centered(axes, threshold: float = 0.2, ignore_axes=()) -> bool:
+    """
+    Return True when every non-ignored axis magnitude is below threshold.
+
+    Xbox-mode triggers (axes 2 and 5 on the EasySMX) rest at +1.0, not 0.0,
+    so they must be excluded from the arming check or the mux never arms.
+    """
+    ignore = set(ignore_axes)
+    return all(
+        abs(float(a)) < threshold
+        for i, a in enumerate(axes)
+        if i not in ignore
+    )
+
+
 class MuxNode(Node):
     def __init__(self):
         super().__init__('mux_node')
@@ -41,12 +56,18 @@ class MuxNode(Node):
         self.declare_parameter('joystick_timeout_sec', 0.5)
         self.declare_parameter('command_timeout_sec', 0.5)
         self.declare_parameter('publish_rate_hz', 50.0)
+        self.declare_parameter('startup_grace_sec', 1.0)
+        self.declare_parameter('arm_axis_threshold', 0.2)
+        self.declare_parameter('arm_ignore_axes', [2, 5])
 
         self._gamepad_btn = self.get_parameter('gamepad_enable_button').value
         self._auto_btn = self.get_parameter('autonomy_enable_button').value
         self._joy_timeout = self.get_parameter('joystick_timeout_sec').value
         self._cmd_timeout = self.get_parameter('command_timeout_sec').value
         publish_rate = self.get_parameter('publish_rate_hz').value
+        self._startup_grace = self.get_parameter('startup_grace_sec').value
+        self._arm_threshold = self.get_parameter('arm_axis_threshold').value
+        self._arm_ignore_axes = tuple(self.get_parameter('arm_ignore_axes').value)
 
         self._latest_joy: Joy = None
         self._joy_stamp = 0.0
@@ -59,6 +80,8 @@ class MuxNode(Node):
         self._auto_stamp = 0.0
 
         self._last_mode = MuxMode.IDLE
+        self._armed = False
+        self._boot_time = time.monotonic()
 
         qos = QoSProfile(
             depth=1,
@@ -111,6 +134,20 @@ class MuxNode(Node):
             self._pub.publish(out)
             self._last_mode = MuxMode.IDLE
             return
+
+        # Boot-time arming: require an idle period plus a centered Joy frame
+        # before honoring bumper presses, so a stuck stick at power-on can't move the robot.
+        if not self._armed:
+            grace_elapsed = (now - self._boot_time) >= self._startup_grace
+            if grace_elapsed and joy_is_centered(
+                joy.axes, self._arm_threshold, self._arm_ignore_axes,
+            ):
+                self._armed = True
+                self.get_logger().info('Mux armed')
+            else:
+                self._pub.publish(out)
+                self._last_mode = MuxMode.IDLE
+                return
 
         mode = select_mode(joy.buttons, self._gamepad_btn, self._auto_btn)
 

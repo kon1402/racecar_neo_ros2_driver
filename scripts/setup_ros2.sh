@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install ROS2 Jazzy + the ROS packages the racecar driver depends on.
-set -e
+set -eo pipefail
 
 # Bootstrap tools needed to add the ROS2 apt repo.
 sudo apt-get install -y -qq curl wget gnupg ca-certificates lsb-release

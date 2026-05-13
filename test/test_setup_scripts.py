@@ -83,6 +83,13 @@ def test_scripts_use_set_dash_e():
         assert 'set -e' in text, f'{name} should `set -e` for fail-fast'
 
 
+def test_scripts_use_pipefail():
+    """Pipefail catches `wget | dpkg -i` style chains where the upstream silently fails."""
+    for name in PHASE_SCRIPTS + [ORCHESTRATOR]:
+        text = (SCRIPTS_DIR / name).read_text()
+        assert 'pipefail' in text, f'{name} should set `pipefail` (use `set -eo pipefail`)'
+
+
 def test_no_stray_colcon_dirs_in_package():
     """build/, install/, log/ must live in the workspace root, not the package."""
     pkg_root = SCRIPTS_DIR.parent
@@ -265,6 +272,18 @@ class TestUdevRules:
         text = self.RULES_FILE.read_text()
         assert f'ATTRS{{idVendor}}=="{vid}"' in text, f'VID {vid} not matched'
         assert f'ATTRS{{idProduct}}=="{pid}"' in text, f'PID {pid} not matched'
+
+    def test_lidar_rule_ignores_modemmanager(self):
+        # ModemManager will probe any tty unless told otherwise. For the lidar's
+        # CP2102, that probe desynced the sllidar SDK's binary frame reader
+        # mid-stream during the 2026-05-12 endurance test and /scan went silent
+        # without the process dying. ID_MM_DEVICE_IGNORE=1 prevents recurrence.
+        text = self.RULES_FILE.read_text()
+        lidar_lines = [ln for ln in text.splitlines() if 'SYMLINK+="lidar"' in ln]
+        assert lidar_lines, 'lidar rule missing'
+        assert any('ID_MM_DEVICE_IGNORE' in ln for ln in lidar_lines), (
+            'lidar rule must set ID_MM_DEVICE_IGNORE=1 to block ModemManager probes'
+        )
 
     def test_maestro_rule_pins_command_interface(self):
         # The Maestro exposes two CDC ACM interfaces (00 = command, 02 = aux TTL).

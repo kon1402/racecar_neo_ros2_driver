@@ -97,6 +97,16 @@ class TestNodesDict:
         # restart. Forward camera doesn't need it (single-USB hub branch).
         assert watchdog.NODES['camera_backward'].get('restart_delay', 0) >= 1
 
+    def test_lidar_has_freshness_threshold(self, watchdog):
+        # sllidar can silently desync from the CP2102 (the SDK swallows
+        # transient read errors); process-presence + topic-advertisement both
+        # stay green. Freshness check on /scan is what catches it.
+        # Threshold must be > 0.1s (one scan period) and < restart cooldown
+        # (so a stall actually triggers a restart instead of being absorbed).
+        fresh = watchdog.NODES['lidar'].get('freshness_sec')
+        assert fresh is not None, 'lidar must define freshness_sec'
+        assert 1.0 <= fresh <= watchdog.RESTART_COOLDOWN
+
 
 class TestConfig:
     def test_poll_interval_reasonable(self, watchdog):
@@ -129,3 +139,43 @@ class TestHelpers:
         assert callable(cb)
         # No such process should exist with that path substring.
         assert cb() is False
+
+
+class TestFreshnessMonitor:
+    """The bookkeeping side of _FreshnessMonitor — independent of rclpy."""
+
+    def test_age_none_before_any_message(self, watchdog):
+        fm = watchdog._FreshnessMonitor.__new__(watchdog._FreshnessMonitor)
+        fm._node = None
+        fm._topics = ['/scan']
+        import threading
+        fm._lock = threading.Lock()
+        fm._last = {}
+        fm._subs = {}
+        assert fm.age('/scan') is None
+
+    def test_age_recent_after_mark(self, watchdog):
+        fm = watchdog._FreshnessMonitor.__new__(watchdog._FreshnessMonitor)
+        fm._node = None
+        fm._topics = ['/scan']
+        import threading
+        fm._lock = threading.Lock()
+        fm._last = {}
+        fm._subs = {}
+        fm._mark('/scan')
+        age = fm.age('/scan')
+        assert age is not None
+        assert 0 <= age < 0.5  # called immediately, should be tiny
+
+    def test_reset_clears_last_seen(self, watchdog):
+        fm = watchdog._FreshnessMonitor.__new__(watchdog._FreshnessMonitor)
+        fm._node = None
+        fm._topics = ['/scan']
+        import threading
+        fm._lock = threading.Lock()
+        fm._last = {}
+        fm._subs = {}
+        fm._mark('/scan')
+        assert fm.age('/scan') is not None
+        fm.reset('/scan')
+        assert fm.age('/scan') is None
