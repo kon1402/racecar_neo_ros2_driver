@@ -24,6 +24,7 @@ This package is the v2 successor to [`racecar-neo-ros2-backend`](https://github.
 |---|---|---|
 | Forward camera | Logitech BRIO | gscam over V4L2 (`/dev/cam_forward`) |
 | Backward camera | Arducam B0578 | gscam over V4L2 (`/dev/cam_backward`) |
+| Depth camera | Intel RealSense D435i | librealsense over USB 3.x (`8086:0b3a`) |
 | 2D LIDAR | RPLIDAR A3-class | UART (`/dev/lidar`) |
 | IMU | LSM9DS1 | I²C (`0x6B` + `0x1E`) |
 | Gamepad | Switch Pro / EasySMX | USB HID (`/dev/input/event*` or `/dev/input/js*`) |
@@ -43,6 +44,7 @@ EasySMX ─→ joy_node ─→ gamepad_node ──┐
 
 Sensor and ML nodes publish independently:
 - `/camera/forward`, `/camera/backward` (sensor_msgs/Image)
+- `/camera/color/image_raw`, `/camera/depth/image_rect_raw`, `/camera/imu` (RealSense D435i — depth, color, IMU)
 - `/imu`, `/mag` (sensor_msgs/Imu, MagneticField)
 - `/scan` (sensor_msgs/LaserScan)
 - `/edgetpu/inference` (vision_msgs/Detection2DArray) — `edgetpu_node` consumes `/camera/forward`
@@ -143,7 +145,7 @@ This brings up an isolated AP on `wlan0` and configures eth0 with both a static 
 
 ### What `setup_all.sh` actually does
 
-Eleven phases, all under `scripts/`:
+Twelve phases, all under `scripts/`:
 
 1. **`setup_ros2.sh`** — ROS2 Jazzy apt repo + message/driver packages
 2. **`setup_dev_tools.sh`** — build tools, Python hardware libs (`smbus` / `serial` / `spidev`), GStreamer dev headers
@@ -152,10 +154,11 @@ Eleven phases, all under `scripts/`:
 5. **`setup_udev.sh`** — installs `/etc/udev/rules.d/99-racecar.rules` (stable `/dev/maestro` etc.)
 6. **`setup_dotmatrix.sh`** — `pip install --user luma.led_matrix`
 7. **`setup_coral.sh`** — installs `libedgetpu1-std`, `tflite_runtime`, `pycoral` from vendored `depend/` artifacts
-8. **`patch_gscam.sh`** — clones `ros-drivers/gscam`, applies the appsink memory-leak fix, builds it as a colcon overlay
-9. **`setup_workspace.sh`** — clones `sllidar_ros2` and runs `colcon build --symlink-install`
-10. **`setup_jupyter.sh`** — `pip install --user jupyterlab`, creates `~/jupyter_ws/`
-11. **`setup_services.sh`** — installs and enables the four systemd units (`racecar-{teleop,watchdog,dashboard,jupyter}.service`)
+8. **`setup_realsense.sh`** — installs `realsense2_camera` (apt) + the Pi 5 IMU IIO permission fix (script, udev rule, boot service)
+9. **`patch_gscam.sh`** — clones `ros-drivers/gscam`, applies the appsink memory-leak fix, builds it as a colcon overlay
+10. **`setup_workspace.sh`** — clones `sllidar_ros2` and runs `colcon build --symlink-install`
+11. **`setup_jupyter.sh`** — `pip install --user jupyterlab`, creates `~/jupyter_ws/`
+12. **`setup_services.sh`** — installs and enables the four systemd units (`racecar-{teleop,watchdog,dashboard,jupyter}.service`)
 
 Individual phase scripts can be run on their own to re-do or skip steps (e.g. `racecar setup networking` for just the networking phase, or `bash scripts/setup_udev.sh` to reinstall the udev rules after a hardware swap).
 
@@ -262,11 +265,15 @@ source install/setup.bash
 racecar teleop                          # or: ros2 launch racecar_neo_ros2_driver teleop.launch.py
 racecar launch camera_forward           # individual nodes too
 racecar launch camera_backward
+racecar launch realsense                # RealSense D435i (depth + color + IMU)
 racecar launch imu
 racecar launch lidar
 racecar launch edgetpu
 racecar launch dotmatrix
 ```
+
+RealSense topics, profiles, and known issues: see [docs/realsense_topics.md](docs/realsense_topics.md).
+
 
 For boot-time startup, see [scripts/](./scripts/) for systemd units and the `setup_all.sh` idempotent installer.
 

@@ -242,6 +242,86 @@ class TestArducam:
             f'rear camera USB cable.'
         )
 
+# ---------------------------------------------------------------------------
+# RealSense D435i
+# ---------------------------------------------------------------------------
+
+@pytest.mark.hardware
+class TestRealSense:
+    """Intel RealSense D435i — depth + color + IMU over USB 3.x."""
+
+    USB_ID = '8086:0b3a'
+
+    def test_usb_present(self):
+        assert _lsusb_match(self.USB_ID), (
+            f'RealSense D435i (USB {self.USB_ID}) not detected on the USB bus. '
+            f'Check the USB 3.0 cable and port.'
+        )
+
+    def test_v4l2_devices_exist(self):
+        out = subprocess.run(
+            ['v4l2-ctl', '--list-devices'],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        assert 'RealSense' in out, (
+            'No RealSense V4L2 devices found. '
+            'Check the USB connection and try: rs-enumerate-devices --compact'
+        )
+
+    def test_rs_enumerate(self):
+        result = subprocess.run(
+            ['rs-enumerate-devices', '--compact'],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, (
+            'rs-enumerate-devices failed. Install: bash scripts/setup_realsense.sh'
+        )
+        assert 'D435I' in result.stdout or 'D435i' in result.stdout, (
+            f'D435i not found in rs-enumerate-devices output:\n{result.stdout}'
+        )
+
+    def test_usb3_connection(self):
+        out = subprocess.run(
+            ['rs-enumerate-devices', '--compact'],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        if 'Usb Type Descriptor' in out:
+            assert '3.' in out.split('Usb Type Descriptor')[1].split('\n')[0], (
+                'RealSense is not on a USB 3.x port. '
+                'Depth + color + IMU at full rate requires USB 3.0+.'
+            )
+
+    def test_imu_permissions(self):
+        iio_base = '/sys/bus/iio/devices'
+        if not os.path.isdir(iio_base):
+            pytest.skip('No IIO subsystem (not running on Pi 5?)')
+        iio_devices = [
+            os.path.join(iio_base, d)
+            for d in os.listdir(iio_base)
+            if d.startswith('iio:device')
+        ]
+        if not iio_devices:
+            pytest.skip('No IIO devices found (RealSense IMU may not be enumerated yet)')
+        bad = []
+        for dev in iio_devices:
+            buf_enable = os.path.join(dev, 'buffer', 'enable')
+            if os.path.exists(buf_enable) and not os.access(buf_enable, os.W_OK):
+                bad.append(buf_enable)
+        assert not bad, (
+            f'IMU IIO permissions not fixed ({len(bad)} file(s) not writable). '
+            'Fix: sudo /usr/local/bin/fix-realsense-imu.sh\n'
+            'Or run: bash scripts/setup_realsense.sh'
+        )
+
+    def test_imu_fix_script_installed(self):
+        script = '/usr/local/bin/fix-realsense-imu.sh'
+        assert os.path.isfile(script), (
+            f'{script} not found. Run: bash scripts/setup_realsense.sh'
+        )
+        assert os.access(script, os.X_OK), (
+            f'{script} is not executable. Fix: sudo chmod +x {script}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Coral EdgeTPU — USB accelerator (Phase 3A)

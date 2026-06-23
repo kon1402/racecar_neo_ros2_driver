@@ -31,6 +31,11 @@ SUBSYSTEM=="video4linux", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="0578", ATT
 # Disable USB autosuspend on the Arducam (prevents driver re-init storms)
 ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="0578", ATTR{power/autosuspend}="-1", ATTR{power/control}="on"
 
+# Intel RealSense D435i (depth + color + IMU camera, RACECAR v2)
+# VID 8086:0b3a. Disable USB autosuspend to prevent disconnects during streaming.
+SUBSYSTEM=="usb", ATTR{idVendor}=="8086", ATTR{idProduct}=="0b3a", ATTR{power/autosuspend}="-1", ATTR{power/control}="on"
+
+
 # Coral EdgeTPU — non-root access in both pre-init and post-init USB IDs
 # Pre-init: 1a6e:089a (Global Unichip). Post-init (after firmware load): 18d1:9302 (Google).
 SUBSYSTEM=="usb", ATTRS{idVendor}=="1a6e", ATTRS{idProduct}=="089a", GROUP="plugdev", MODE="0660"

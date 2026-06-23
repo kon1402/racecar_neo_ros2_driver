@@ -33,6 +33,8 @@ PACKAGE = 'racecar_neo_ros2_driver'
 DRIVER_LIB = '/install/racecar_neo_ros2_driver/lib/racecar_neo_ros2_driver'
 GSCAM_LIB = '/install/gscam/lib/gscam/gscam_node'
 SLLIDAR_LIB = '/install/sllidar_ros2/lib/sllidar_ros2/sllidar_node'
+# RealSense ships from /opt/ros/jazzy (apt package), not the workspace install tree.
+REALSENSE_EXECUTABLE_PATH = '/realsense2_camera/realsense2_camera_node'
 
 
 def _is_running(path_substring: str):
@@ -78,6 +80,16 @@ def _i2c_probe(bus: int, addr: int) -> bool:
         finally:
             b.close()
     except Exception:  # noqa: BLE001
+        return False
+
+def _usb_device_present(usb_id: str) -> bool:
+    """Check whether a USB vendor:product ID appears in lsusb output."""
+    try:
+        result = subprocess.run(
+            ['lsusb'], capture_output=True, text=True, timeout=5,
+        )
+        return usb_id.lower() in result.stdout.lower()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
 
 
@@ -156,6 +168,14 @@ NODES = {
         'kill_pattern': 'gscam_node.*__node:=camera_backward',
         'process_check': _is_running('gscam_node.*__node:=camera_backward'),
         'restart_delay': 5,  # USB bus settle
+    },
+    'realsense': {
+        'topic': '/camera/color/image_raw',
+        'launch': 'realsense.launch.py',
+        'device_check': lambda: _usb_device_present('8086:0b3a'),
+        'device_label': 'USB 8086:0b3a (RealSense D435i)',
+        'kill_pattern': 'realsense2_camera_node',
+        'process_check': _is_running(REALSENSE_EXECUTABLE_PATH),
     },
 }
 
